@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import os.path
+import select
+import socket
+
+DEBUG = False
+
+parser = argparse.ArgumentParser(description='route packets')
+parser.add_argument('asn', type=int, help="AS Number")
+parser.add_argument('networks', metavar='networks', type=str, nargs='+', help="networks")
+args = parser.parse_args()
+
+##########################################################################################
+
+# Message Fields
+TYPE = "type"
+SRCE = "src"
+DEST = "dst"
+MESG = "msg"
+TABL = "table"
+
+# Message Types
+DATA = "data"
+DUMP = "dump"
+UPDT = "update"
+RVKE = "revoke"
+NRTE = "no route"
+
+# Update Message Fields
+NTWK = "network"
+NMSK = "netmask"
+ORIG = "origin"
+LPRF = "localpref"
+APTH = "ASPath"
+SORG = "selfOrigin"
+
+# internal route info
+CUST = "cust"
+PEER = "peer"
+PROV = "prov"
+
+
+##########################################################################################
+
+def get_masked(address_bin, net_size):
+    # Extract Network ID from 32 binary
+    network = address_bin[0:32 - (32 - net_size)]
+    return network
+
+
+def ip_to_bin(ip):
+    return '.'.join([bin(int(x) + 256)[3:] for x in ip.split('.')])
+
+
+def ip_in_net(ip, dest_ip, dest_mask):
+    ip_bin = ip_to_bin(ip)
+    dest_ip_bin = ip_to_bin(dest_ip)
+    dest_mask_bin = ip_to_bin(dest_mask)
+    dest_prefix = dest_mask_bin.count("1")
+
+    dest_network = get_masked(dest_ip_bin, dest_prefix)
+    ip_network = get_masked(ip_bin, dest_prefix)
+
+    return dest_network == ip_network
+
+
+def prune_routes(routes, prune_by):
+    """ prune routes by certain criteria """
+    outroutes = []
+    # ASPath has to be separated as it's done by length rather than value
+    if prune_by == "ASPath":
+        key = len(routes[0][prune_by])
+        x = 0
+        while x < len(routes) and len(routes[x][prune_by]) == key:
+            # append route if it's equal to the first
+            outroutes.append(routes[x])
+            x = x + 1
+        return outroutes
+    # we only need to check the first element, as we want the order of the sort to remain constant
+    key = routes[0][prune_by]
+    x = 0
+    while x < len(routes) and routes[x][prune_by] == key:
+        # append route if it's equal to the first
+        outroutes.append(routes[x])
+        x = x + 1
+    return outroutes
+
+
+def get_shortest_as_path(routes):
+    """ select the route with the shortest AS Path """
+    # sorts routes by shortest -> longest ASPath
+    outroutes = sorted(routes, key=lambda route: len(route["ASPath"]))
+    return outroutes
+
+
+def get_highest_preference(routes):
+    """ select the route with the highest local pref """
+    # sorts routes by highest -> lowest localpref
+    outroutes = sorted(routes, key=lambda route: route["localpref"], reverse=True)
+    return outroutes
+
+
+def get_self_origin(routes):
+    """ select self originating routes """
+    # sorts routes by True -> False
+    outroutes = sorted(routes, key=lambda route: not route["selfOrigin"])
+    return outroutes
+
+
+def get_origin_routes(routes):
+    """ select origin routes: IGP > EGP > UNK """
+    order = {'IGP': 1, 'EGP': 2, 'UNK': 3}
+    # sorts routes by IGP > EGP > UNK
+    outroutes = sorted(routes, key=lambda route: order[route["origin"]])
+    return outroutes
+
+
+def get_ip_routes(routes):
+    """ select ip routes """
+
+    def calc_ip(ip_addr):
+        as_arr = ip_addr.split(".")
+        as_num = int(as_arr[0]) * 256 * 256 * 256 + int(as_arr[1]) * 256 * 256 + int(as_arr[2] * 256) + int(as_arr[3])
+        return as_num
+
+    # sorts routes by lowest IP -> highest
+    outroutes = sorted(routes, key=lambda route: calc_ip(route["peer"]))
+    return outroutes
+
+
+class Router:
+    asn = None
+    routes = None
+    updates = None
+    relations = None
+    sockets = None
+    revokes = None
+    non_aggregation = None
+
+    def __init__(self, asn, networks):
+        self.asn = asn
+        self.routes = []
+        self.updates = []
+        self.revokes = []
+        self.non_aggregation = []
+        self.relations = {}
+        self.sockets = {}
+        for relationship in networks:
+            network, relation = relationship.split("-")
+            if DEBUG:
+                print("Starting socket for", network, relation)
+            self.sockets[network] = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            self.sockets[network].setblocking(False)
+            self.sockets[network].connect(network)
+            self.relations[network] = relation
+        return
+
+    def lookup_routes(self, daddr):
+        outroutes = []
+        for routing in self.routes:
+            if ip_in_net(daddr, routing[NTWK], routing[NMSK]):
+                outroutes.append(routing)
+        return outroutes
+
+    def filter_relationships(self, srcif, routes):
+        """ Don't allow Peer->Peer, Peer->Prov, or Prov->Peer forwards """
+        outroutes = []
+        # get the src relationship
+        src_relationship = self.relations[srcif]
+        for r in routes:
+            target = r["peer"]
+            dest_re = self.relations[target]
+            if src_relationship == PEER and dest_re == PEER:
+                continue
+            elif src_relationship == PEER and dest_re == PROV:
+                continue
+            elif src_relationship == PROV and dest_re == PEER:
+                continue
+            else:
+                outroutes.append(r)
+        return outroutes
+
+    def filter_longest_common_prefix(self, ip_to_compare, networks):
+        longest_prefix = 0
+        outroutes = []
+
+        for route in networks:
+            common_prefix = os.path.commonprefix([ip_to_bin(ip_to_compare), ip_to_bin(route["network"])])
+            if len(common_prefix) > longest_prefix:
+                longest_prefix = len(common_prefix)
+                outroutes = [route]
+            elif len(common_prefix) == longest_prefix:
+                outroutes.append(route)
+
+        return outroutes
+
+    def get_route(self, srcif, daddr):
+        """	Select the best route for a given address	"""
+        peer = None
+        routes = self.lookup_routes(daddr)
+        # Rules go here
+        if routes:
+            # 1. Highest Preference (highest localpref)
+            routes = get_highest_preference(routes)
+            # check if equal then ↓
+            # 2. Self Origin
+            if len(routes) > 1 and routes[0]["localpref"] == routes[1]["localpref"]:
+                routes = get_self_origin(prune_routes(routes, "localpref"))
+                # 3. Shortest ASPath
+                if len(routes) > 1 and routes[0]["selfOrigin"] == routes[1]["selfOrigin"]:
+                    routes = get_shortest_as_path(prune_routes(routes, "selfOrigin"))
+                    # 4. IGP > EGP > UNK
+                    if len(routes) > 1 and len(routes[0]["ASPath"]) == len(routes[1]["ASPath"]):
+                        routes = get_origin_routes(prune_routes(routes, "ASPath"))
+                        # 5. Lowest IP Address
+                        if len(routes) > 1 and routes[0]["origin"] == routes[1]["origin"]:
+                            routes = get_ip_routes(prune_routes(routes, "origin"))
+            # Final check: enforce peering relationships
+            routes = self.filter_relationships(srcif, routes)
+            # Final Final check: longest prefix matching
+            routes = self.filter_longest_common_prefix(daddr, routes)
+            if len(routes) != 0:
+                peer = routes[0]["peer"]
+            if DEBUG:
+                print("Peer: ", peer)
+        return self.sockets[peer] if peer else None
+
+    def forward(self, srcif, packet):
+        self.sockets[srcif].sendall(json.dumps(packet).encode())
+
+    def coalesce(self):
+        """	coalesce any routes that are right next to each other	"""
+        pass_count = 0
+        total_routes = len(self.routes)
+
+        # decrease the netmask by 1 for bits format and get the Dotted Decimal format
+        def decr(netmask):
+            cidr = sum([str(bin(int(octet))).count("1") for octet in netmask.split(".")])
+            cidr = cidr - 1
+            new_mask = (0xffffffff >> (32 - cidr)) << (32 - cidr)
+            return (str((0xff000000 & new_mask) >> 24) + '.' +
+                    str((0x00ff0000 & new_mask) >> 16) + '.' +
+                    str((0x0000ff00 & new_mask) >> 8) + '.' +
+                    str((0x000000ff & new_mask)))
+
+        # Find bounds to find range of neighbors
+        def find_bounds(netmask):
+            cidr = sum([str(bin(int(octet))).count("1") for octet in netmask.split(".")]) - 1
+            if cidr < 16:
+                bound_prefix = 8
+            elif cidr < 24:
+                bound_prefix = 16
+            else:
+                bound_prefix = 24
+            return 2 ** ((cidr - bound_prefix) - 2)
+
+        aggregated_routes = []
+        aggregated = True
+        for x in range(len(self.routes)):
+            for aggr_route in aggregated_routes:
+                if self.routes[x][ORIG] == aggr_route[ORIG] \
+                        and self.routes[x][LPRF] == aggr_route[LPRF] \
+                        and self.routes[x][APTH] == aggr_route[APTH] \
+                        and self.routes[x][SORG] == aggr_route[SORG] \
+                        and self.routes[x][NMSK] == aggr_route[NMSK] \
+                        and self.routes[x][PEER] == aggr_route[PEER]:
+                    count = 0
+                    route_nmsk = self.routes[x][NMSK].split(".")
+                    while count < len(route_nmsk) and route_nmsk[count] == "255":
+                        count = count + 1
+                    if count == 4:
+                        continue
+                    else:
+                        route_ntwk = int(self.routes[x][NTWK].split(".")[count - 1])
+                        aggr_ntwk = int(aggr_route[NTWK].split(".")[count - 1])
+                        route_ntwk_diff = "".join(ip_to_bin(self.routes[x][NTWK]).split("."))
+                        aggr_ntwk_diff = "".join(ip_to_bin(aggr_route[NTWK]).split("."))
+                        common_prefix = os.path.commonprefix([route_ntwk_diff, aggr_ntwk_diff])
+                        route_ntwk_diff_to_compare = route_ntwk_diff.replace(common_prefix, "")
+                        aggr_ntwk_diff_to_compare = aggr_ntwk_diff.replace(common_prefix, "")
+                        bigger_string = max(int(route_ntwk_diff_to_compare, 2), int(aggr_ntwk_diff_to_compare, 2))
+
+                        # did all this 20 minutes after waking up, it's a mess but at least it worked.
+                        start_1_diff = (int(route_ntwk_diff_to_compare, 2) - int(aggr_ntwk_diff_to_compare,
+                                                                                 2)) == bigger_string
+
+                        if abs(route_ntwk - aggr_ntwk) < find_bounds(aggr_route[NMSK]) and start_1_diff:
+                            aggr_route[NTWK] = min(aggr_route[NTWK], self.routes[x][NTWK])
+                            aggr_route[NMSK] = decr(aggr_route[NMSK])
+                            aggregated = False
+                        else:
+                            continue
+                else:
+                    continue
+            if aggregated:
+                aggregated_routes.append(self.routes[x])
+                pass_count = pass_count + 1
+            else:
+                aggregated = True
+        self.routes = aggregated_routes
+        if pass_count != total_routes:
+            self.coalesce()
+        return True
+
+    def update(self, srcif, packet):
+        message = packet["msg"]
+        received_update = {"network": message["network"],
+                           "netmask": message["netmask"],
+                           "localpref": message["localpref"],
+                           "ASPath": message["ASPath"],
+                           "origin": message["origin"],
+                           "selfOrigin": message["selfOrigin"],
+                           "peer": packet["src"],
+                           "aggregationCount": 0
+                           }
+
+        # save a copy of the announcement in case you need it later.
+        self.updates.append(received_update)
+        # save a copy to the non_aggregation
+        self.non_aggregation.append(received_update)
+
+        # add an entry to your forwarding table.
+        new_as = message["ASPath"]
+
+        # add self asn to the packet
+        new_as.append(self.asn)
+        self.routes.append(received_update)
+
+        # run coalesce
+        self.coalesce()
+
+        # potentially send copies of the announcement to neighboring routers
+        self.send_update_to_peer(self.relations[srcif], packet, srcif)
+        return False
+
+    def send_update(self, route, packet):
+        """ send a newly created packet """
+        # Replace the 4th octet with 1
+        packet["src"] = '.'.join(route.split('.', 3)[:3]) + '.1'
+        packet["dst"] = route
+
+        # Send the updated update packet to the given designation
+        self.sockets[route].sendall(json.dumps(packet).encode())
+
+    def disaggregate(self):
+        for i in self.non_aggregation:
+            for j in self.revokes:
+                for p in j['msg']:
+                    if i['network'] == p['network'] and j["src"] == i["peer"]:
+                        self.non_aggregation.remove(i)
+
+        for i in self.non_aggregation:
+            if i['netmask'].split(".")[2] != "0" and i['netmask'].split(".")[2] != "255":
+                i['netmask'] = "{}.{}.{}.{}".format(i['netmask'].split(".")[0], i['netmask'].split(".")[1],
+                                                    "255", i['netmask'].split(".")[3])
+        self.routes = self.non_aggregation
+        self.coalesce()
+
+    def revoke(self, packet):
+        """	handle revoke packets	"""
+        # TODO
+        # 1) save a copy of the revocation, in case we need it later
+        self.revokes.append(packet)
+
+        # 2) remove the dead entry from list of stored updates
+        src = packet["src"]
+        revoke_msg = packet["msg"]
+        for network in revoke_msg:
+            for x in range(len(self.routes) - 1):
+                routing = self.routes[x]
+                peer = routing["peer"] == src
+                ip = routing["network"] == network["network"]
+                netmask = routing["netmask"] == network["netmask"]
+                if peer and ip and netmask:
+                    self.routes.pop(x)
+
+        self.disaggregate()
+        self.send_update_to_peer(self.relations[src], packet, packet["src"])
+        return True
+
+    def send_update_to_peer(self, relationship, packet_to_forward, source):
+        if relationship == "cust":
+            # a) update received from a customer: send revoke to all other neighbors
+            for sock in self.sockets:
+                if sock != source:
+                    self.send_update(sock, packet_to_forward)
+        elif relationship == "prov" or relationship == "peer":
+            # b) update received from a peer or provider: only send revoke to our customers
+            for sock in self.sockets:
+                if self.relations[sock] == "cust" and sock != source:
+                    self.send_update(sock, packet_to_forward)
+
+    def dump(self, packet):
+        """	handles dump table requests	"""
+        table_msg = []
+        for route in self.routes:
+            item = {NTWK: route[NTWK], NMSK: route[NMSK], PEER: route[PEER]}
+            table_msg.append(item)
+        complete_table = {SRCE: packet[DEST], DEST: packet[SRCE], MESG: table_msg, TYPE: "table"}
+        self.sockets[packet[SRCE]].sendall(json.dumps(complete_table).encode())
+        if DEBUG:
+            print("Routes are")
+            for i in self.routes:
+                print(i)
+            print("SomethingEnd")
+        return True
+
+    def handle_packet(self, srcif, packet):
+        """	dispatches a packet """
+
+        # get the type of the received packet
+        packetType = packet["type"]
+
+        if packetType == "update":
+            return self.update(srcif, packet)
+
+        elif packetType == "data":
+            route = self.get_route(srcif, packet["dst"])
+            if route:
+                route.sendall(json.dumps(packet).encode())
+                if DEBUG:
+                    print("Routed data", route, packet["dst"])
+            else:
+                data = {
+                    "src": srcif[:-1] + "1",
+                    "dst": packet["src"],
+                    "type": "no route",
+                    "msg": {}
+                }
+                self.forward(srcif, data)
+            return
+
+        elif packetType == "no route":
+            return
+
+        elif packetType == "revoke":
+            return self.revoke(packet)
+
+        elif packetType == "dump":
+            return self.dump(packet)
+
+        else:
+            return
+
+    def send_error(self, conn, msg):
+        return
+
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                try:
+                    k = conn.recv(65535)
+                except:
+                    # either died on a connection reset, or was SIGTERM's by parent
+                    return
+                if k:
+                    for sock in self.sockets:
+                        if self.sockets[sock] == conn:
+                            srcif = sock
+                    msg = json.loads(k)
+                    if not self.handle_packet(srcif, msg):
+                        self.send_error(conn, msg)
+                else:
+                    return
+
+
+if __name__ == "__main__":
+    router = Router(args.asn, args.networks)
+    router.run()
